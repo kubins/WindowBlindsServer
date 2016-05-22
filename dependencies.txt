@@ -4,3 +4,4 @@ QThread
 QFile
 QUdpSocket
 QDebug
+QSemaphore

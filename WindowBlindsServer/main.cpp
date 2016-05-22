@@ -11,6 +11,7 @@
 #include <QFile>
 #include <QUdpSocket>
 #include <QDebug>
+#include <QSemaphore>
 
 class GPIO_CONTROL : public QObject
 {
@@ -41,7 +42,7 @@ class BLIND_THREAD : public QThread
     Q_OBJECT
 
 public:
-    BLIND_THREAD(quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB);
+    BLIND_THREAD(quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB, QSharedPointer<QSemaphore> Semaphore);
     virtual ~BLIND_THREAD();
 
     //! ukončí thread
@@ -81,6 +82,8 @@ private:
     QScopedPointer<GPIO_CONTROL> m_oDirection;  //!< GPIO pro nastavení směru otáčení
     QScopedPointer<GPIO_CONTROL> m_oFB;         //!< GPIO pro získání stavu rulety
 
+    QSharedPointer<QSemaphore> m_Semaphore;     //!< it controls access to the common HW resources
+
     bool m_bRunning;    //!< příznak běžícího threadu
     bool m_bStop;       //!< příznak pro ukončení threadu
     bool m_bCalibre;    //!< požadavek na spuštění kalibrace rolety
@@ -104,7 +107,7 @@ class BLIND : public QObject
     Q_OBJECT
 
 public:
-    BLIND(QObject *pParent, quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB);
+    BLIND(QObject *pParent, quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB, QSharedPointer<QSemaphore> Semaphore);
     virtual ~BLIND() {}
 
     //! vrátí pozici rolety
@@ -114,6 +117,7 @@ public:
 
 private:
     QScopedPointer<BLIND_THREAD> m_oWorkingThread;  //!< thread řídící motor
+    QSharedPointer<QSemaphore> m_Semaphore;         //!< it controls access to the common HW resources
 };
 
 class BLINDS_CONTROLLER : public QObject
@@ -127,6 +131,7 @@ public:
 private:
     QHash<qint32, QSharedPointer<BLIND> > m_arrBlinds;  //!< pole tříd pro řízení rolet
     QUdpSocket m_oUDP_Socket;                           //!< UDP soket pro příjem požadavků na nastavení rolet
+    QSharedPointer<QSemaphore> m_Semaphore;             //!< it controls access to the common HW resources (it limites the number of simultaneously driven window blinds)
 
 private slots:
     // reakce na příjem UDP paketu
@@ -217,11 +222,13 @@ void GPIO_CONTROL::SetValue(bool bValue)
     }
 }
 
-BLIND_THREAD::BLIND_THREAD(quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB) : QThread()
+BLIND_THREAD::BLIND_THREAD(quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB, QSharedPointer<QSemaphore> Semaphore) : QThread()
 {
     m_oPulse.reset(new GPIO_CONTROL(this, nGPIO_Pulse, GPIO_CONTROL::GPIO_Type::OUTPUT));
     m_oDirection.reset(new GPIO_CONTROL(this, nGPIO_Direction, GPIO_CONTROL::GPIO_Type::OUTPUT));
     m_oFB.reset(new GPIO_CONTROL(this, nGPIO_FB, GPIO_CONTROL::GPIO_Type::INPUT));
+
+    m_Semaphore = Semaphore;
 
     m_bRunning = false;
     m_bStop = false;
@@ -264,6 +271,8 @@ void BLIND_THREAD::run()
                 m_eAction = ACTION::None;
                 m_nActualPosition = 0;
                 m_bCalibre = false;
+                // it releases HW resource
+                m_Semaphore.data()->release();
             }
             else
             {
@@ -275,6 +284,8 @@ void BLIND_THREAD::run()
             {
                 // hotovo
                 m_eAction = ACTION::None;
+                // it releases HW resource
+                m_Semaphore.data()->release();
             }
             if(m_nActualPosition < m_nTargetPositionWorkingThread)
             {
@@ -290,6 +301,11 @@ void BLIND_THREAD::run()
         case ACTION::None:
             if(m_bCalibre)
             {
+                // it tries to acquire HW resource
+                if(m_Semaphore.isNull() || !m_Semaphore.data()->tryAcquire())
+                {
+                    break;
+                }
                 // kalibrace
                 m_eAction = ACTION::Calibration;
                 SetDirection(DIRECTION::UP);
@@ -297,6 +313,11 @@ void BLIND_THREAD::run()
             }
             if(m_nActualPosition != m_nTargetPosition)
             {
+                // it tries to acquire HW resource
+                if(m_Semaphore.isNull() || !m_Semaphore.data()->tryAcquire())
+                {
+                    break;
+                }
                 // pohyb
                 m_eAction = ACTION::Movement;
                 m_nTargetPositionWorkingThread = m_nTargetPosition;
@@ -339,9 +360,9 @@ bool BLIND_THREAD::IsBlindUp()
     return false;
 }
 
-BLIND::BLIND(QObject *pParent, quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB) : QObject(pParent)
+BLIND::BLIND(QObject *pParent, quint16 nGPIO_Pulse, quint16 nGPIO_Direction, quint16 nGPIO_FB, QSharedPointer<QSemaphore> Semaphore) : QObject(pParent)
 {
-    m_oWorkingThread.reset(new BLIND_THREAD(nGPIO_Pulse, nGPIO_Direction, nGPIO_FB));
+    m_oWorkingThread.reset(new BLIND_THREAD(nGPIO_Pulse, nGPIO_Direction, nGPIO_FB, Semaphore));
     // odstartujeme thread
     m_oWorkingThread.data()->start();
 }
@@ -365,8 +386,10 @@ void BLIND::SetValuePercent(qint32 nValuePercent)
 
 BLINDS_CONTROLLER::BLINDS_CONTROLLER(QObject *pParent) : QObject(pParent)
 {
+    // it sets the maximum count of simultaneously driven window blinds
+    m_Semaphore.reset(new QSemaphore(2));
     // nastavíme rolety
-    m_arrBlinds[1] = QSharedPointer<BLIND>(new BLIND(this, 178, 193, 199));
+    m_arrBlinds[1] = QSharedPointer<BLIND>(new BLIND(this, 178, 193, 199, m_Semaphore));
     // nastavíme UDP soket pro příjem požaadvků
     connect(&m_oUDP_Socket, SIGNAL(readyRead()), this, SLOT(OnUDP_ProcessPendingMessage()), Qt::UniqueConnection);
     if(!m_oUDP_Socket.bind(5674))
