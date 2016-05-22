@@ -129,9 +129,23 @@ public:
     virtual ~BLINDS_CONTROLLER() {}
 
 private:
+    struct Client
+    {
+        Client() : m_nPort(-1) {}
+        Client(QHostAddress Address, qint32 nPort) : m_Address(Address), m_nPort(nPort) {}
+
+        QHostAddress m_Address;     //!< client address
+        qint32 m_nPort;             //!< client port
+
+        inline bool operator==(const Client& X){ return X.m_Address == m_Address && X.m_nPort == m_nPort; }
+        inline bool operator!=(const Client& X){ return X.m_Address != m_Address || X.m_nPort != m_nPort; }
+    };
+
     QHash<qint32, QSharedPointer<BLIND> > m_arrBlinds;  //!< pole tříd pro řízení rolet
-    QUdpSocket m_oUDP_Socket;                           //!< UDP soket pro příjem požadavků na nastavení rolet
+    QUdpSocket m_oUDP_SocketForReceiving;               //!< UDP socket bound to the specific port intended for window blind settings receiving
+    QUdpSocket m_oUDP_SocketForSending;                 //!< UDP socket intended for clients information about the new states
     QSharedPointer<QSemaphore> m_Semaphore;             //!< it controls access to the common HW resources (it limites the number of simultaneously driven window blinds)
+    QList<Client> m_arrClients;                         //!< list of registered clients (these clients are informed about the changes)
 
 private slots:
     // reakce na příjem UDP paketu
@@ -391,8 +405,8 @@ BLINDS_CONTROLLER::BLINDS_CONTROLLER(QObject *pParent) : QObject(pParent)
     // nastavíme rolety
     m_arrBlinds[1] = QSharedPointer<BLIND>(new BLIND(this, 178, 193, 199, m_Semaphore));
     // nastavíme UDP soket pro příjem požaadvků
-    connect(&m_oUDP_Socket, SIGNAL(readyRead()), this, SLOT(OnUDP_ProcessPendingMessage()), Qt::UniqueConnection);
-    if(!m_oUDP_Socket.bind(5674))
+    connect(&m_oUDP_SocketForReceiving, SIGNAL(readyRead()), this, SLOT(OnUDP_ProcessPendingMessage()), Qt::UniqueConnection);
+    if(!m_oUDP_SocketForReceiving.bind(5674))
     {
         qDebug() << "cannot bind UDP communication port";
     }
@@ -404,41 +418,86 @@ void BLINDS_CONTROLLER::OnUDP_ProcessPendingMessage()
     QHostAddress SenderAddress;
     quint16 nSenderPort = 0;
 
-    while(m_oUDP_Socket.hasPendingDatagrams())
+    while(m_oUDP_SocketForReceiving.hasPendingDatagrams())
     {
-        arrDatagram.resize(m_oUDP_Socket.pendingDatagramSize());
-        if(m_oUDP_Socket.readDatagram(arrDatagram.data(), arrDatagram.size(), &SenderAddress, &nSenderPort) == -1)
+        arrDatagram.resize(m_oUDP_SocketForReceiving.pendingDatagramSize());
+        if(m_oUDP_SocketForReceiving.readDatagram(arrDatagram.data(), arrDatagram.size(), &SenderAddress, &nSenderPort) == -1)
         {
             qDebug() << "unable to read UDP datagram";
         }
         else
         {
             QStringList arr_strInput = QString(arrDatagram).split(";");
-            if(arr_strInput.count() == 3)
+            if(arr_strInput.count() >= 1)
             {
                 if(arr_strInput.at(0) == "set_blind")
                 {
-                    qint32 nID = arr_strInput.at(1).toInt();
-                    qint32 nPercentValue = arr_strInput.at(2).toInt();
-                    if(m_arrBlinds.contains(nID))
+                    if(arr_strInput.count() >= 3)
                     {
-                        if(nPercentValue > 100)
+                        qint32 nID = arr_strInput.at(1).toInt();
+                        qint32 nPercentValue = arr_strInput.at(2).toInt();
+                        if(m_arrBlinds.contains(nID))
                         {
-                            nPercentValue = 100;
+                            if(nPercentValue > 100)
+                            {
+                                nPercentValue = 100;
+                            }
+                            if(nPercentValue < 0)
+                            {
+                                nPercentValue = 0;
+                            }
+                            qDebug() << "blind ID" << nID << "value" << nPercentValue;
+                            if(!m_arrBlinds[nID].isNull())
+                            {
+                                m_arrBlinds[nID].data()->SetValuePercent(nPercentValue);
+                                // send the new value to the other clients
+                                Client ClientHasSetTheValue(SenderAddress, arr_strInput.at(1).toInt());
+                                foreach(Client ClientToBeInformed, m_arrClients)
+                                {
+                                    if(ClientToBeInformed != ClientHasSetTheValue)
+                                    {
+                                        if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + arr_strInput.at(1) + ";" + arr_strInput.at(2)).toLatin1()), ClientToBeInformed.m_Address, ClientToBeInformed.m_nPort) == -1)
+                                        {
+                                            qDebug() << "error while sending the new window blind position";
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        if(nPercentValue < 0)
+                        else
                         {
-                            nPercentValue = 0;
-                        }
-                        qDebug() << "blind ID" << nID << "value" << nPercentValue;
-                        if(!m_arrBlinds[nID].isNull())
-                        {
-                            m_arrBlinds[nID].data()->SetValuePercent(nPercentValue);
+                            qDebug() << "unknown blind ID";
                         }
                     }
                     else
                     {
-                        qDebug() << "unknown blind ID";
+                        qDebug() << "unknown UDP data format";
+                    }
+                }
+                if(arr_strInput.at(0) == "register")
+                {
+                    if(arr_strInput.count() >= 2)
+                    {
+                        Client NewClientToBeRegistrated(SenderAddress, arr_strInput.at(1).toInt());
+                        qDebug() << "new client registration attempt, client address" << NewClientToBeRegistrated.m_Address << "port" << NewClientToBeRegistrated.m_nPort;
+                        if(!m_arrClients.contains(NewClientToBeRegistrated))
+                        {
+                            m_arrClients.append(NewClientToBeRegistrated);
+                            // refresh the client by the actual window blind positions
+                            QHashIterator<qint32, QSharedPointer<BLIND> > iBlinds(m_arrBlinds);
+                            while(iBlinds.hasNext())
+                            {
+                                iBlinds.next();
+                                if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + QString::number(iBlinds.key()) + ";" + QString::number(iBlinds.value().data()->GetValuePercent())).toLatin1()), NewClientToBeRegistrated.m_Address, NewClientToBeRegistrated.m_nPort) == -1)
+                                {
+                                    qDebug() << "error while sending the new window blind position";
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        qDebug() << "unknown UDP data format";
                     }
                 }
             }
