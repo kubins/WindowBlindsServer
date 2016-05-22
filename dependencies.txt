@@ -1,0 +1,6 @@
+QCoreApplication
+QSharedPointer
+QThread
+QFile
+QUdpSocket
+QDebug
