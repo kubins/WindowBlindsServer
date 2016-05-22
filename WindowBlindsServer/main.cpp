@@ -427,83 +427,87 @@ void BLINDS_CONTROLLER::OnUDP_ProcessPendingMessage()
         }
         else
         {
-            QStringList arr_strInput = QString(arrDatagram).split(";");
-            if(arr_strInput.count() >= 1)
+            QStringList arr_strMessages = QString(arrDatagram).split("#");
+            foreach(QString strMessage, arr_strMessages)
             {
-                if(arr_strInput.at(0) == "set_blind")
+                QStringList arr_strMessageData = strMessage.split(";");
+                if(arr_strMessageData.count() >= 1)
                 {
-                    if(arr_strInput.count() >= 3)
+                    if(arr_strMessageData.at(0) == "set_blind")
                     {
-                        qint32 nID = arr_strInput.at(1).toInt();
-                        qint32 nPercentValue = arr_strInput.at(2).toInt();
-                        if(m_arrBlinds.contains(nID))
+                        if(arr_strMessageData.count() >= 4)
                         {
-                            if(nPercentValue > 100)
+                            qint32 nID = arr_strMessageData.at(1).toInt();
+                            qint32 nPercentValue = arr_strMessageData.at(2).toInt();
+                            if(m_arrBlinds.contains(nID))
                             {
-                                nPercentValue = 100;
-                            }
-                            if(nPercentValue < 0)
-                            {
-                                nPercentValue = 0;
-                            }
-                            qDebug() << "blind ID" << nID << "value" << nPercentValue;
-                            if(!m_arrBlinds[nID].isNull())
-                            {
-                                m_arrBlinds[nID].data()->SetValuePercent(nPercentValue);
-                                // send the new value to the other clients
-                                Client ClientHasSetTheValue(SenderAddress, arr_strInput.at(1).toInt());
-                                foreach(Client ClientToBeInformed, m_arrClients)
+                                if(nPercentValue > 100)
                                 {
-                                    if(ClientToBeInformed != ClientHasSetTheValue)
+                                    nPercentValue = 100;
+                                }
+                                if(nPercentValue < 0)
+                                {
+                                    nPercentValue = 0;
+                                }
+                                qDebug() << "blind ID" << nID << "value" << nPercentValue;
+                                if(!m_arrBlinds[nID].isNull())
+                                {
+                                    m_arrBlinds[nID].data()->SetValuePercent(nPercentValue);
+                                    // send the new value to the other clients
+                                    Client ClientHasSetTheValue(SenderAddress, arr_strMessageData.at(3).toInt());
+                                    foreach(Client ClientToBeInformed, m_arrClients)
                                     {
-                                        if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + arr_strInput.at(1) + ";" + arr_strInput.at(2)).toLatin1()), ClientToBeInformed.m_Address, ClientToBeInformed.m_nPort) == -1)
+                                        if(ClientToBeInformed != ClientHasSetTheValue)
                                         {
-                                            qDebug() << "error while sending the new window blind position";
+                                            if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + arr_strMessageData.at(1) + ";" + arr_strMessageData.at(2)).toLatin1() + "#"), ClientToBeInformed.m_Address, ClientToBeInformed.m_nPort) == -1)
+                                            {
+                                                qDebug() << "error while sending the new window blind position";
+                                            }
                                         }
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                qDebug() << "unknown blind ID";
+                            }
+                        }
+                        else
+                        {
+                            qDebug() << "unknown UDP data format";
+                        }
+                    }
+                    if(arr_strMessageData.at(0) == "register")
+                    {
+                        if(arr_strMessageData.count() >= 2)
+                        {
+                            Client NewClientToBeRegistrated(SenderAddress, arr_strMessageData.at(1).toInt());
+                            qDebug() << "new client registration attempt, client address" << NewClientToBeRegistrated.m_Address << "port" << NewClientToBeRegistrated.m_nPort;
+                            if(!m_arrClients.contains(NewClientToBeRegistrated))
+                            {
+                                m_arrClients.append(NewClientToBeRegistrated);
+                                // refresh the client by the actual window blind positions
+                                QHashIterator<qint32, QSharedPointer<BLIND> > iBlinds(m_arrBlinds);
+                                while(iBlinds.hasNext())
+                                {
+                                    iBlinds.next();
+                                    if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + QString::number(iBlinds.key()) + ";" + QString::number(iBlinds.value().data()->GetValuePercent()) + "#").toLatin1()), NewClientToBeRegistrated.m_Address, NewClientToBeRegistrated.m_nPort) == -1)
+                                    {
+                                        qDebug() << "error while sending the new window blind position";
                                     }
                                 }
                             }
                         }
                         else
                         {
-                            qDebug() << "unknown blind ID";
+                            qDebug() << "unknown UDP data format";
                         }
                     }
-                    else
-                    {
-                        qDebug() << "unknown UDP data format";
-                    }
                 }
-                if(arr_strInput.at(0) == "register")
+                else
                 {
-                    if(arr_strInput.count() >= 2)
-                    {
-                        Client NewClientToBeRegistrated(SenderAddress, arr_strInput.at(1).toInt());
-                        qDebug() << "new client registration attempt, client address" << NewClientToBeRegistrated.m_Address << "port" << NewClientToBeRegistrated.m_nPort;
-                        if(!m_arrClients.contains(NewClientToBeRegistrated))
-                        {
-                            m_arrClients.append(NewClientToBeRegistrated);
-                            // refresh the client by the actual window blind positions
-                            QHashIterator<qint32, QSharedPointer<BLIND> > iBlinds(m_arrBlinds);
-                            while(iBlinds.hasNext())
-                            {
-                                iBlinds.next();
-                                if(!m_oUDP_SocketForSending.writeDatagram(QByteArray(QString("blind_position;" + QString::number(iBlinds.key()) + ";" + QString::number(iBlinds.value().data()->GetValuePercent())).toLatin1()), NewClientToBeRegistrated.m_Address, NewClientToBeRegistrated.m_nPort) == -1)
-                                {
-                                    qDebug() << "error while sending the new window blind position";
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        qDebug() << "unknown UDP data format";
-                    }
+                    qDebug() << "unknown UDP data format";
                 }
-            }
-            else
-            {
-                qDebug() << "unknown UDP data format";
             }
         }
     }
